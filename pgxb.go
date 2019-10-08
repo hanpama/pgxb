@@ -12,29 +12,37 @@ type BatchSender interface {
 	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
 
-// Batchable 인터페이스는 배치 처리될 수 있는 작업이다.
-type Batchable interface {
-	// Queue 함수는 주어진 배치에 1개의 쿼리를 Queue 한다.
-	Queue(*pgx.Batch)
-	// Done 함수에서는 주어진 결과를 1회 읽는다.
-	Done(pgx.BatchResults, error)
+// Batcher 인터페이스는 쿼리를 큐잉하고 일정 갯수나 시간 프레임으로 묶어서 처리한 후 콜백을 호출한다.
+type Batcher interface {
+	BatchQuery(query string, args []interface{}, callback func(pgx.Rows, error))
+	BatchQueryRow(query string, args []interface{}, callback func(pgx.Row, error))
+	BatchExec(query string, args []interface{}, callback func(ExecResult, error))
 }
 
-// Batcher 인터페이스는 쿼리를 큐잉하고 일정 갯수나 시간 프레임으로 묶어서 처리한 후
-// Batchable의 Done 메서드를 결과와 함께 호출한다.
-type Batcher interface {
-	// Batch 메서드는 주어진 작업을 큐에 넣는다.
-	Batch(Batchable)
+type ExecResult interface {
+	RowsAffected() int64
+	String() string
 }
 
 type batchWorker struct {
 	sender   BatchSender
 	wait     time.Duration
 	maxBatch int
-	items    chan Batchable
+	items    chan batchItem
 	closed   chan struct{}
 	err      error
 }
+
+type batchType int8
+type batchItem struct {
+	query    string
+	args     []interface{}
+	callBack interface{}
+}
+
+type callbackQuery func(pgx.Rows, error)
+type callbackQueryRow func(pgx.Row, error)
+type callbackExec func(ExecResult, error)
 
 // NewBatchWorker 함수는 새로운 배치 워커를 만든다.
 func NewBatchWorker(ctx context.Context, sender BatchSender, maxBatch int, wait time.Duration) Batcher {
@@ -42,12 +50,8 @@ func NewBatchWorker(ctx context.Context, sender BatchSender, maxBatch int, wait 
 		sender:   sender,
 		wait:     wait,
 		maxBatch: maxBatch,
-		// 버퍼드 채널의 길이는 최대 배치 갯수만큼 되어야 한다.
-		// 버퍼가 꽉 차있는 경우에는 현재 배치 처리 이후에 push 가능하다.
-		// 기다리던 중 배처가 닫히는 경우에는 push 단계에서 오류.
-		items: make(chan Batchable, maxBatch),
-		// 이 배치 워커가 종료(오류임)되면 닫힌다.
-		closed: make(chan struct{}),
+		items:    make(chan batchItem, maxBatch),
+		closed:   make(chan struct{}),
 	}
 	go func() {
 		for {
@@ -64,7 +68,7 @@ func NewBatchWorker(ctx context.Context, sender BatchSender, maxBatch int, wait 
 
 func (b *batchWorker) work(ctx context.Context) error {
 	timerDone := make(chan struct{})
-	var currentItems []Batchable
+	var currentItems []batchItem
 	batch := &pgx.Batch{}
 
 loop:
@@ -78,7 +82,7 @@ loop:
 				}()
 			}
 			currentItems = append(currentItems, item)
-			item.Queue(batch)
+			batch.Queue(item.query, item.args...)
 			if len(currentItems) >= b.maxBatch {
 				break loop
 			}
@@ -88,19 +92,39 @@ loop:
 			return ctx.Err()
 		}
 	}
-
 	res := b.sender.SendBatch(ctx, batch)
 	for _, item := range currentItems {
-		item.Done(res, nil)
+		switch callback := item.callBack.(type) {
+		case callbackQuery:
+			callback(res.Query())
+		case callbackQueryRow:
+			callback(res.QueryRow(), nil)
+		case callbackExec:
+			callback(res.Exec())
+		}
 	}
 
 	return res.Close()
 }
 
-func (b *batchWorker) Batch(item Batchable) {
+func (b *batchWorker) BatchQuery(query string, args []interface{}, callback func(pgx.Rows, error)) {
 	select {
-	case b.items <- item:
+	case b.items <- batchItem{query, args, callbackQuery(callback)}:
 	case <-b.closed:
-		item.Done(nil, b.err)
+		callback(nil, b.err)
+	}
+}
+func (b *batchWorker) BatchQueryRow(query string, args []interface{}, callback func(pgx.Row, error)) {
+	select {
+	case b.items <- batchItem{query, args, callbackQueryRow(callback)}:
+	case <-b.closed:
+		callback(nil, b.err)
+	}
+}
+func (b *batchWorker) BatchExec(query string, args []interface{}, callback func(ExecResult, error)) {
+	select {
+	case b.items <- batchItem{query, args, callbackExec(callback)}:
+	case <-b.closed:
+		callback(nil, b.err)
 	}
 }
