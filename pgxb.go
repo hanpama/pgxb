@@ -19,6 +19,7 @@ type Batcher interface {
 	BatchExec(query string, args []interface{}, callback func(ExecResult, error))
 }
 
+// ExecResult represents PostgreSQL execution result
 type ExecResult interface {
 	RowsAffected() int64
 	String() string
@@ -29,7 +30,7 @@ type batchWorker struct {
 	wait     time.Duration
 	maxBatch int
 	items    chan batchItem
-	closed   chan struct{}
+	done     chan struct{}
 	err      error
 }
 
@@ -50,23 +51,25 @@ func NewBatchWorker(ctx context.Context, sender BatchSender, maxBatch int, wait 
 		sender:   sender,
 		wait:     wait,
 		maxBatch: maxBatch,
-		items:    make(chan batchItem, maxBatch),
-		closed:   make(chan struct{}),
+		items:    make(chan batchItem),
+		done:     make(chan struct{}),
 	}
+	errc := make(chan error)
 	go func() {
 		for {
-			// 고루틴 하나가 큐를 비우면서 작업한다.
-			b.err = b.work(ctx)
-			if b.err != nil {
-				close(b.closed) // Push 기다리던 고루틴들을 unblock
-				return          // 이 고루틴도 종료
+			select {
+			case b.err = <-errc:
+				close(b.done)
+				return
+			default:
+				b.work(ctx, errc)
 			}
 		}
 	}()
 	return b
 }
 
-func (b *batchWorker) work(ctx context.Context) error {
+func (b *batchWorker) work(ctx context.Context, errc chan<- error) {
 	timerDone := make(chan struct{})
 	var currentItems []batchItem
 	batch := &pgx.Batch{}
@@ -78,7 +81,7 @@ loop:
 			if len(currentItems) == 0 { // 처음 요소가 들어올 때 타이머 작동
 				go func() {
 					time.Sleep(b.wait)
-					timerDone <- struct{}{}
+					close(timerDone)
 				}()
 			}
 			currentItems = append(currentItems, item)
@@ -89,42 +92,52 @@ loop:
 		case <-timerDone: // 시간이 지나면 실행되고 종료.
 			break loop
 		case <-ctx.Done(): // 컨텍스트에 의해 종료
-			return ctx.Err()
-		}
-	}
-	res := b.sender.SendBatch(ctx, batch)
-	for _, item := range currentItems {
-		switch callback := item.callBack.(type) {
-		case callbackQuery:
-			callback(res.Query())
-		case callbackQueryRow:
-			callback(res.QueryRow(), nil)
-		case callbackExec:
-			callback(res.Exec())
+			errc <- ctx.Err()
+			return
 		}
 	}
 
-	return res.Close()
+	go func() {
+		res := b.sender.SendBatch(ctx, batch)
+		for _, item := range currentItems {
+			switch callback := item.callBack.(type) {
+			case callbackQuery:
+				callback(res.Query())
+			case callbackQueryRow:
+				callback(res.QueryRow(), nil)
+			case callbackExec:
+				c, err := res.Exec()
+				callback(c, err)
+			}
+		}
+		err := res.Close()
+		if err != nil {
+			select {
+			case <-b.done:
+			case errc <- err:
+			}
+		}
+	}()
 }
 
 func (b *batchWorker) BatchQuery(query string, args []interface{}, callback func(pgx.Rows, error)) {
 	select {
 	case b.items <- batchItem{query, args, callbackQuery(callback)}:
-	case <-b.closed:
+	case <-b.done:
 		callback(nil, b.err)
 	}
 }
 func (b *batchWorker) BatchQueryRow(query string, args []interface{}, callback func(pgx.Row, error)) {
 	select {
 	case b.items <- batchItem{query, args, callbackQueryRow(callback)}:
-	case <-b.closed:
+	case <-b.done:
 		callback(nil, b.err)
 	}
 }
 func (b *batchWorker) BatchExec(query string, args []interface{}, callback func(ExecResult, error)) {
 	select {
 	case b.items <- batchItem{query, args, callbackExec(callback)}:
-	case <-b.closed:
+	case <-b.done:
 		callback(nil, b.err)
 	}
 }
