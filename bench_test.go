@@ -30,7 +30,7 @@ func BenchmarkBatchForPool(b *testing.B) {
 	ctx := context.Background()
 	pool := getPool(ctx)
 	sender := &testSender{sender: pool}
-	bw := pgxb.NewBatchWorker(ctx, sender, 150, 5*time.Microsecond)
+	bw := pgxb.NewBatcher(ctx, sender, 150, 5*time.Microsecond)
 	b.ResetTimer()
 	b.ReportAllocs()
 	b.SetParallelism(500)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v4"
 )
 
@@ -12,26 +13,41 @@ type BatchSender interface {
 	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
 
-// Batcher 인터페이스는 쿼리를 큐잉하고 일정 갯수나 시간 프레임으로 묶어서 처리한 후 콜백을 호출한다.
-type Batcher interface {
-	BatchQuery(query string, args []interface{}, callback func(pgx.Rows, error))
-	BatchQueryRow(query string, args []interface{}, callback func(pgx.Row, error))
-	BatchExec(query string, args []interface{}, callback func(ExecResult, error))
-}
-
-// ExecResult represents PostgreSQL execution result
-type ExecResult interface {
-	RowsAffected() int64
-	String() string
-}
-
-type batchWorker struct {
+// Batcher 는 쿼리를 큐잉하고 일정 갯수나 시간 프레임으로 묶어서 처리한 후 콜백을 호출한다.
+type Batcher struct {
 	sender   BatchSender
 	wait     time.Duration
 	maxBatch int
 	items    chan batchItem
 	done     chan struct{}
 	err      error
+}
+
+// BatchQuery 메서드는 주어진 쿼리를 배치하고 실행이 완료되었을 때 콜백을 실행한다.
+func (b *Batcher) BatchQuery(query string, args []interface{}, callback func(pgx.Rows, error)) {
+	select {
+	case b.items <- batchItem{query, args, callbackQuery(callback)}:
+	case <-b.done:
+		callback(nil, b.err)
+	}
+}
+
+// BatchQueryRow 메서드는 주어진 쿼리를 배치하고 실행이 완료되었을 때 콜백을 실행한다.
+func (b *Batcher) BatchQueryRow(query string, args []interface{}, callback func(pgx.Row, error)) {
+	select {
+	case b.items <- batchItem{query, args, callbackQueryRow(callback)}:
+	case <-b.done:
+		callback(nil, b.err)
+	}
+}
+
+// BatchExec 메서드는 주어진 쿼리를 배치하고 실행이 완료되었을 때 콜백을 실행한다.
+func (b *Batcher) BatchExec(query string, args []interface{}, callback func(pgconn.CommandTag, error)) {
+	select {
+	case b.items <- batchItem{query, args, callbackExec(callback)}:
+	case <-b.done:
+		callback(nil, b.err)
+	}
 }
 
 type batchType int8
@@ -43,11 +59,11 @@ type batchItem struct {
 
 type callbackQuery func(pgx.Rows, error)
 type callbackQueryRow func(pgx.Row, error)
-type callbackExec func(ExecResult, error)
+type callbackExec func(pgconn.CommandTag, error)
 
-// NewBatchWorker 함수는 새로운 배치 워커를 만든다.
-func NewBatchWorker(ctx context.Context, sender BatchSender, maxBatch int, wait time.Duration) Batcher {
-	b := &batchWorker{
+// NewBatcher 함수는 새로운 배치 워커를 만든다.
+func NewBatcher(ctx context.Context, sender BatchSender, maxBatch int, wait time.Duration) *Batcher {
+	b := &Batcher{
 		sender:   sender,
 		wait:     wait,
 		maxBatch: maxBatch,
@@ -69,7 +85,7 @@ func NewBatchWorker(ctx context.Context, sender BatchSender, maxBatch int, wait 
 	return b
 }
 
-func (b *batchWorker) work(ctx context.Context, errc chan<- error) {
+func (b *Batcher) work(ctx context.Context, errc chan<- error) {
 	timerDone := make(chan struct{})
 	var currentItems []batchItem
 	batch := &pgx.Batch{}
@@ -118,26 +134,4 @@ loop:
 			}
 		}
 	}()
-}
-
-func (b *batchWorker) BatchQuery(query string, args []interface{}, callback func(pgx.Rows, error)) {
-	select {
-	case b.items <- batchItem{query, args, callbackQuery(callback)}:
-	case <-b.done:
-		callback(nil, b.err)
-	}
-}
-func (b *batchWorker) BatchQueryRow(query string, args []interface{}, callback func(pgx.Row, error)) {
-	select {
-	case b.items <- batchItem{query, args, callbackQueryRow(callback)}:
-	case <-b.done:
-		callback(nil, b.err)
-	}
-}
-func (b *batchWorker) BatchExec(query string, args []interface{}, callback func(ExecResult, error)) {
-	select {
-	case b.items <- batchItem{query, args, callbackExec(callback)}:
-	case <-b.done:
-		callback(nil, b.err)
-	}
 }

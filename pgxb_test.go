@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hanpama/pgxb"
+	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
@@ -57,7 +58,7 @@ func TestPGXB(t *testing.T) {
 	pool := getPool(ctx)
 	s := &testSender{sender: pool}
 
-	b := pgxb.NewBatchWorker(ctx, s, 50, 150*time.Microsecond)
+	b := pgxb.NewBatcher(ctx, s, 50, 150*time.Microsecond)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 250; i++ {
@@ -66,7 +67,7 @@ func TestPGXB(t *testing.T) {
 
 		go func() {
 			b.BatchExec(`INSERT INTO todo (content, done) VALUES ($1, null)`, args,
-				func(res pgxb.ExecResult, err error) {
+				func(res pgconn.CommandTag, err error) {
 					wg.Done()
 					if err != nil {
 						panic(err)
